@@ -1,6 +1,7 @@
 import os
 import re
 
+from ConfigSpace.configuration_space import Configuration
 from ConfigSpace.hyperparameters import (
     CategoricalHyperparameter,
     UniformFloatHyperparameter,
@@ -11,9 +12,12 @@ import numpy as np
 
 import pytest
 
+from pytest_mock import mocker  # noqa F401
+
 import torch
 
 from autoPyTorch.pipeline.components.setup.early_preprocessor.utils import get_preprocess_transforms
+from autoPyTorch.pipeline.components.training.trainer.utils import Lookahead
 from autoPyTorch.pipeline.tabular_classification import TabularClassificationPipeline
 from autoPyTorch.utils.common import FitRequirement
 from autoPyTorch.utils.hyperparameter_search_space_update import HyperparameterSearchSpaceUpdates, \
@@ -181,8 +185,8 @@ class TestTabularClassification:
         # Then fitting a optimizer should fail if no network:
         assert 'optimizer' in pipeline.named_steps.keys()
         with pytest.raises(
-                ValueError,
-                match=r"To fit .+?, expected fit dictionary to have 'network' but got .*"
+            ValueError,
+            match=r"To fit .+?, expected fit dictionary to have 'network' but got .*"
         ):
             pipeline.named_steps['optimizer'].fit({'dataset_properties': {}}, None)
 
@@ -193,8 +197,8 @@ class TestTabularClassification:
         # Then fitting a optimizer should fail if no network:
         assert 'lr_scheduler' in pipeline.named_steps.keys()
         with pytest.raises(
-                ValueError,
-                match=r"To fit .+?, expected fit dictionary to have 'optimizer' but got .*"
+            ValueError,
+            match=r"To fit .+?, expected fit dictionary to have 'optimizer' but got .*"
         ):
             pipeline.named_steps['lr_scheduler'].fit({'dataset_properties': {}}, None)
 
@@ -279,3 +283,53 @@ class TestTabularClassification:
             # As we are setting num_layers to 1 for fully connected
             # head, units_layer does not exist in the configspace
             assert 'fully_connected:units_layer' in e.args[0]
+
+    @pytest.mark.parametrize('trainer', ['StandardTrainer',
+                                         'AdversarialTrainer',
+                                         'MixUpTrainer',
+                                         'RowCutMixTrainer',
+                                         'RowCutOutTrainer'])
+    @pytest.mark.parametrize('lr_scheduler', ['CosineAnnealingWarmRestarts',
+                                              'ReduceLROnPlateau'])
+    def test_trainer_cocktails(self, fit_dictionary, mocker, lr_scheduler, trainer):  # noqa F811
+        fit_dictionary['epochs'] = 10
+        pipeline = TabularClassificationPipeline(
+            dataset_properties=fit_dictionary['dataset_properties'],
+            include={'lr_scheduler': [lr_scheduler], 'trainer': [trainer]})
+        cs = pipeline.get_hyperparameter_search_space()
+        config = cs.get_default_configuration()
+        assert trainer == config.get('trainer:__choice__')
+        config_dict = config.get_dictionary()
+        config_dict[f'trainer:{trainer}:use_stochastic_weight_averaging'] = True
+        config_dict[f'trainer:{trainer}:use_snapshot_ensemble'] = True
+        if not config_dict[f'trainer:{trainer}:use_lookahead_optimizer']:
+            config_dict[f'trainer:{trainer}:use_lookahead_optimizer'] = True
+            default_values = Lookahead.get_hyperparameter_search_space().get_default_configuration().get_dictionary()
+            for key, value in default_values.items():
+                config_dict[f'trainer:{trainer}:Lookahead:{key}'] = value
+        config = Configuration(cs, values=config_dict)
+        assert lr_scheduler == config.get('lr_scheduler:__choice__')
+        pipeline.set_hyperparameters(config)
+
+        pipeline.fit(fit_dictionary.copy())
+        X = pipeline.transform(fit_dictionary.copy())
+        assert 'is_cyclic_scheduler' in X and \
+               (X['is_cyclic_scheduler'] or config.get('lr_scheduler:__choice__') == 'ReduceLROnPlateau')
+
+        trainer = config.get('trainer:__choice__')
+        assert 'network_snapshots' in X and \
+               len(X['network_snapshots']) == config.get(f'trainer:{trainer}:se_lastk')
+
+        mocker.patch("autoPyTorch.pipeline.components.setup.network.base_network.NetworkComponent._predict",
+                     return_value=torch.Tensor([1]))
+        # Assert that predict gives no error when swa and se are on
+        assert isinstance(pipeline.predict(fit_dictionary['X_train']), np.ndarray)
+        # As SE is True, _predict should be called 3 times
+        assert pipeline.named_steps['network']._predict.call_count == 3
+
+        optimizer = pipeline.named_steps['trainer'].choice.optimizer
+        assert isinstance(optimizer, Lookahead)
+
+        # check if final value of la_step is epochs * num_batches % la_steps
+        assert optimizer.get_la_step() == fit_dictionary['epochs'] * len(list(X['train_data_loader'].batch_sampler)) \
+               % optimizer._total_la_steps

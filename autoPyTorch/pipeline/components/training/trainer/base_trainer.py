@@ -1,5 +1,13 @@
 import time
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+from ConfigSpace.conditions import EqualsCondition
+from ConfigSpace.configuration_space import ConfigurationSpace
+from ConfigSpace.hyperparameters import (
+    CategoricalHyperparameter,
+    Constant
+)
 
 import numpy as np
 
@@ -7,14 +15,16 @@ import pandas as pd
 
 import torch
 from torch.autograd import Variable
-from torch.optim import Optimizer
+from torch.optim import Optimizer, swa_utils
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from autoPyTorch.constants import BINARY
+from autoPyTorch.constants import BINARY, CLASSIFICATION_TASKS, STRING_TO_TASK_TYPES
 from autoPyTorch.pipeline.components.training.base_training import autoPyTorchTrainingComponent
 from autoPyTorch.pipeline.components.training.metrics.utils import calculate_score
-from autoPyTorch.utils.implementations import get_loss_weight_strategy
+from autoPyTorch.pipeline.components.training.trainer.utils import Lookahead, swa_average_function
+from autoPyTorch.utils.common import FitRequirement
+from autoPyTorch.utils.implementations import LossWeightStrategyWeighted
 from autoPyTorch.utils.logging_ import PicklableClientLogger
 
 
@@ -165,11 +175,47 @@ class RunSummary(object):
 
 
 class BaseTrainerComponent(autoPyTorchTrainingComponent):
-
-    def __init__(self, random_state: Optional[Union[np.random.RandomState, int]] = None) -> None:
+    """
+    Base class for training
+    Args:
+        weighted_loss (bool, default=True): In case for classification, whether to weight
+            the loss function according to the distribution of classes in the target
+        use_stochastic_weight_averaging (bool, default=True): whether to use stochastic
+            weight averaging
+        use_snapshot_ensemble (bool, default=True): whether to use snapshot
+            ensemble
+        se_lastk (int, default=3): Number of snapshots of the network to maintain
+        use_lookahead_optimizer (bool, default=True): whether to use lookahead
+            optimizer
+        random_state:
+        **lookahead_config:
+    """
+    def __init__(self, weighted_loss: bool = True,
+                 use_stochastic_weight_averaging: bool = True,
+                 use_snapshot_ensemble: bool = True,
+                 se_lastk: int = 3,
+                 use_lookahead_optimizer: bool = True,
+                 random_state: Optional[Union[np.random.RandomState, int]] = None,
+                 swa_model: Optional[torch.nn.Module] = None,
+                 model_snapshots: Optional[List[torch.nn.Module]] = None,
+                 **lookahead_config: Any) -> None:
         super().__init__()
         self.random_state = random_state
-        self.weighted_loss: bool = False
+        self.weighted_loss = weighted_loss
+        self.use_stochastic_weight_averaging = use_stochastic_weight_averaging
+        self.use_snapshot_ensemble = use_snapshot_ensemble
+        self.se_lastk = se_lastk
+        self.use_lookahead_optimizer = use_lookahead_optimizer
+        self.swa_model = swa_model
+        self.model_snapshots = model_snapshots
+        # Add default values for the lookahead optimizer
+        if len(lookahead_config) == 0:
+            lookahead_config = {f'{Lookahead.__name__}:la_steps': 6,
+                                f'{Lookahead.__name__}:la_alpha': 0.6}
+        self.lookahead_config = lookahead_config
+        self.add_fit_requirements([
+            FitRequirement("is_cyclic_scheduler", (bool,), user_defined=False, dataset_property=False),
+        ])
 
     def prepare(
         self,
@@ -198,7 +244,7 @@ class BaseTrainerComponent(autoPyTorchTrainingComponent):
         if self.weighted_loss:
             weights = self.get_class_weights(output_type, labels)
             if output_type == BINARY:
-                kwargs['pos_weight'] = weights
+                kwargs['weight'] = weights
             else:
                 kwargs['weight'] = weights
 
@@ -210,7 +256,24 @@ class BaseTrainerComponent(autoPyTorchTrainingComponent):
         # setup the model
         self.model = model.to(device)
 
+        # in case we are using swa, maintain an averaged model,
+        if self.use_stochastic_weight_averaging:
+            self.swa_model = swa_utils.AveragedModel(self.model, avg_fn=swa_average_function)
+
+        # in case we are using se or swa, initialise budget_threshold to know when to start swa or se
+        self._budget_threshold = 0
+        if self.use_stochastic_weight_averaging or self.use_snapshot_ensemble:
+            assert budget_tracker.max_epochs is not None, "Can only use stochastic weight averaging or snapshot " \
+                                                          "ensemble when budget is epochs"
+            self._budget_threshold = int(0.75 * budget_tracker.max_epochs)
+
+        # in case we are using se, initialise list to store model snapshots
+        if self.use_snapshot_ensemble:
+            self.model_snapshots = list()
+
         # setup the optimizers
+        if self.use_lookahead_optimizer:
+            optimizer = Lookahead(optimizer=optimizer, config=self.lookahead_config)
         self.optimizer = optimizer
 
         # The budget tracker
@@ -240,6 +303,36 @@ class BaseTrainerComponent(autoPyTorchTrainingComponent):
         If returns True, the training is stopped
 
         """
+        if X['is_cyclic_scheduler']:
+            if hasattr(self.scheduler, 'T_cur') and self.scheduler.T_cur == 0 and epoch != 1:
+                if self.use_stochastic_weight_averaging:
+                    assert self.swa_model is not None, "SWA model can't be none when" \
+                                                       " stochastic weight averaging is enabled"
+                    self.swa_model.update_parameters(self.model)
+                if self.use_snapshot_ensemble:
+                    assert self.model_snapshots is not None, "model snapshots container can't be " \
+                                                             "none when snapshot ensembling is enabled"
+                    model_copy = deepcopy(self.swa_model) if self.use_stochastic_weight_averaging \
+                        else deepcopy(self.model)
+                    assert model_copy is not None
+                    model_copy.cpu()
+                    self.model_snapshots.append(model_copy)
+                    self.model_snapshots = self.model_snapshots[-self.se_lastk:]
+        else:
+            if epoch > self._budget_threshold:
+                if self.use_stochastic_weight_averaging:
+                    assert self.swa_model is not None, "SWA model can't be none when" \
+                                                       " stochastic weight averaging is enabled"
+                    self.swa_model.update_parameters(self.model)
+                if self.use_snapshot_ensemble:
+                    assert self.model_snapshots is not None, "model snapshots container can't be " \
+                                                             "none when snapshot ensembling is enabled"
+                    model_copy = deepcopy(self.swa_model) if self.use_stochastic_weight_averaging \
+                        else deepcopy(self.model)
+                    assert model_copy is not None
+                    model_copy.cpu()
+                    self.model_snapshots.append(model_copy)
+                    self.model_snapshots = self.model_snapshots[-self.se_lastk:]
         return False
 
     def train_epoch(self, train_loader: torch.utils.data.DataLoader, epoch: int,
@@ -378,7 +471,8 @@ class BaseTrainerComponent(autoPyTorchTrainingComponent):
 
     def get_class_weights(self, output_type: int, labels: Union[np.ndarray, torch.Tensor, pd.DataFrame]
                           ) -> np.ndarray:
-        strategy = get_loss_weight_strategy(output_type)
+        # hardcoding LossWeightedStrategy. change after fix losses PR merged
+        strategy = LossWeightStrategyWeighted()
         weights = strategy(y=labels)
         weights = torch.from_numpy(weights)
         weights = weights.type(torch.FloatTensor).to(self.device)
@@ -417,3 +511,51 @@ class BaseTrainerComponent(autoPyTorchTrainingComponent):
             Callable: a lambda that contains the new criterion calculation recipe
         """
         raise NotImplementedError()
+
+    @staticmethod
+    def get_hyperparameter_search_space(dataset_properties: Optional[Dict] = None,
+                                        weighted_loss: Tuple[Tuple, bool] = ((True, False), True),
+                                        use_stochastic_weight_averaging: Tuple[Tuple, bool] = ((True, False), True),
+                                        use_snapshot_ensemble: Tuple[Tuple, bool] = ((True, False), True),
+                                        se_lastk: Tuple[Tuple, int] = ((3,), 3),
+                                        use_lookahead_optimizer: Tuple[Tuple, bool] = ((True, False), True),
+                                        la_steps: Tuple[Tuple, int, bool] = ((5, 10), 6, False),
+                                        la_alpha: Tuple[Tuple, float, bool] = ((0.5, 0.8), 0.6, False),
+                                        ) -> ConfigurationSpace:
+        weighted_loss = CategoricalHyperparameter("weighted_loss", choices=weighted_loss[0],
+                                                  default_value=weighted_loss[1])
+        use_swa = CategoricalHyperparameter("use_stochastic_weight_averaging",
+                                            choices=use_stochastic_weight_averaging[0],
+                                            default_value=use_stochastic_weight_averaging[1])
+        use_se = CategoricalHyperparameter("use_snapshot_ensemble",
+                                           choices=use_snapshot_ensemble[0],
+                                           default_value=use_snapshot_ensemble[1])
+
+        # Note, this is not easy to be considered as a hyperparameter.
+        # When used with cyclic learning rates, it depends on the number
+        # of restarts.
+        se_lastk = Constant('se_lastk', se_lastk[1])
+
+        use_lookahead_optimizer = CategoricalHyperparameter("use_lookahead_optimizer",
+                                                            choices=use_lookahead_optimizer[0],
+                                                            default_value=use_lookahead_optimizer[1])
+
+        config_space = Lookahead.get_hyperparameter_search_space(la_steps=la_steps,
+                                                                 la_alpha=la_alpha)
+        parent_hyperparameter = {'parent': use_lookahead_optimizer, 'value': True}
+
+        cs = ConfigurationSpace()
+        cs.add_hyperparameters([use_swa, use_se, se_lastk, use_lookahead_optimizer])
+        cs.add_configuration_space(
+            Lookahead.__name__,
+            config_space,
+            parent_hyperparameter=parent_hyperparameter
+        )
+        cond = EqualsCondition(se_lastk, use_se, True)
+        cs.add_condition(cond)
+
+        if dataset_properties is not None:
+            if STRING_TO_TASK_TYPES[dataset_properties['task_type']] not in CLASSIFICATION_TASKS:
+                cs.add_hyperparameters([weighted_loss])
+
+        return cs

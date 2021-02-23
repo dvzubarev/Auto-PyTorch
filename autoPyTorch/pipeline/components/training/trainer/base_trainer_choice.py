@@ -15,7 +15,7 @@ import numpy as np
 import pynisher
 
 import torch
-from torch.optim import Optimizer
+from torch.optim import Optimizer, swa_utils
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -33,6 +33,7 @@ from autoPyTorch.pipeline.components.training.trainer.base_trainer import (
     BudgetTracker,
     RunSummary,
 )
+from autoPyTorch.pipeline.components.training.trainer.utils import Lookahead, update_model_state_dict_from_swa
 from autoPyTorch.utils.common import FitRequirement
 from autoPyTorch.utils.logging_ import get_named_client_logger
 
@@ -196,6 +197,12 @@ class TrainerChoice(autoPyTorchChoice):
 
         if default is None:
             defaults = ['StandardTrainer',
+                        'AdversarialTrainer',
+                        'GridCutMixTrainer',
+                        'GridCutOutTrainer',
+                        'MixUpTrainer',
+                        'RowCutMixTrainer',
+                        'RowCutOutTrainer',
                         ]
             for default_ in defaults:
                 if default_ in available_trainers:
@@ -274,6 +281,11 @@ class TrainerChoice(autoPyTorchChoice):
             y=y,
             **kwargs
         )
+        # Add snapshots to base network to enable
+        # predicting with snapshot ensemble
+        self.choice = cast(autoPyTorchComponent, self.choice)
+        if self.choice.use_snapshot_ensemble:
+            X['network_snapshots'].extend(self.choice.model_snapshots)
 
         if X['use_pynisher']:
             # Normally the X[network] is a pointer to the object, so at the
@@ -286,7 +298,7 @@ class TrainerChoice(autoPyTorchChoice):
 
         # TODO: when have the optimizer code, the pynisher object might have failed
         # We should process this function as Failure if so trough fit_function.exit_status
-        return cast(autoPyTorchComponent, self.choice)
+        return self.choice
 
     def _fit(self, X: Dict[str, Any], y: Any = None, **kwargs: Any) -> torch.nn.Module:
         """
@@ -398,6 +410,15 @@ class TrainerChoice(autoPyTorchChoice):
             epoch += 1
 
             torch.cuda.empty_cache()
+
+        if self.choice.use_stochastic_weight_averaging:
+            # update batch norm statistics
+            swa_utils.update_bn(X['train_data_loader'], self.choice.swa_model.double())
+            # change model
+            update_model_state_dict_from_swa(X['network'], self.choice.swa_model.state_dict())
+            if self.choice.use_snapshot_ensemble:
+                for model in self.choice.model_snapshots:
+                    swa_utils.update_bn(X['train_data_loader'], model.double())
 
         # wrap up -- add score if not evaluating every epoch
         if not self.eval_valid_each_epoch(X):
@@ -601,3 +622,24 @@ class TrainerChoice(autoPyTorchChoice):
         """ Allow a nice understanding of what components where used """
         string = str(self.run_summary)
         return string
+
+    def _get_search_space_updates(self, prefix: Optional[str] = None) -> Dict[str, Tuple]:
+        """Get the search space updates with the given prefix
+
+        Keyword Arguments:
+            prefix {str} -- Only return search space updates with given prefix (default: {None})
+
+        Returns:
+            dict -- Mapping of search space updates. Keys don't contain the prefix.
+        """
+        updates = super()._get_search_space_updates(prefix=prefix)
+
+        result: Dict[str, Tuple] = dict()
+
+        # iterate over all search space updates of this node and filter the ones out, that have the given prefix
+        for key in updates.keys():
+            if key.startswith(Lookahead.__name__):
+                result[key[len(Lookahead.__name__) + 1:]] = updates[key]
+            else:
+                result[key] = updates[key]
+        return result
